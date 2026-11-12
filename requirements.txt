@@ -1,0 +1,3 @@
+numpy>=1.24
+# optional: only needed for local dev screenshots/tests
+playwright>=1.40

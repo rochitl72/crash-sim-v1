@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CrashLab v1 — 2D crash reconstruction</title>
+<style>
+:root{--bg:#0b0f14;--panel:#121820;--panel2:#18202a;--line:#263240;--ink:#e8edf2;--muted:#8f9bab;--accent:#2ec4b6}
+*{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:12px 18px;border-bottom:1px solid var(--line)}
+header b{font-size:17px}header .sub{color:var(--muted);font-size:13px}
+select{background:var(--panel2);color:var(--ink);border:1px solid var(--line);border-radius:7px;padding:5px 8px;font:inherit}
+main{display:grid;grid-template-columns:1fr 360px;height:calc(100vh - 53px)}
+@media(max-width:860px){main{grid-template-columns:1fr;height:auto}#side{height:50vh}}
+#stage{position:relative;background:#0e141b}
+canvas{display:block;width:100%;height:100%}
+#side{border-left:1px solid var(--line);padding:14px 16px;overflow:auto}
+h2{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:14px 0 6px;font-weight:650}
+h2:first-child{margin-top:0}
+.story{font-size:13px;color:#c8d1db;line-height:1.5}
+.tag{display:inline-block;border:1px solid var(--line);border-radius:99px;padding:2px 9px;font-size:11px;color:var(--muted);margin:2px 4px 0 0}
+.vrow{display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--line)}
+.sw{width:11px;height:11px;border-radius:3px;flex:none}
+.vrow b{font-size:13px}.vrow .note{color:var(--muted);font-size:11.5px}
+.ev{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:8px 10px;margin-bottom:8px;font-size:12.5px}
+.ev b{color:var(--accent)}
+.controls{display:flex;align-items:center;gap:10px;padding:10px 16px;border-top:1px solid var(--line);background:var(--panel)}
+button{font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--ink);padding:6px 12px;cursor:pointer}
+input[type=range]{flex:1}
+.t{font:12px ui-monospace,monospace;color:var(--muted);min-width:70px;text-align:right}
+.kv{display:flex;justify-content:space-between;font-size:12.5px;padding:2px 0;color:#c8d1db}
+.kv b{color:var(--ink)}
+footer{padding:10px 16px;color:var(--muted);font-size:11.5px;border-top:1px solid var(--line)}
+.ok{color:#7ee2a8}.bad{color:#ff8a8a}
+</style>
+</head>
+<body>
+<header>
+  <b>CrashLab v1</b><span class="sub">2D rigid-body crash reconstruction — no 3D, no damage model, no AI</span>
+  <select id="sceneSel" style="margin-left:auto"></select>
+</header>
+<main>
+  <div id="stage"><canvas id="cv"></canvas></div>
+  <div id="side">
+    <h2>Scene</h2>
+    <div id="title" style="font-size:16px;font-weight:650"></div>
+    <div id="subtitle" style="color:var(--muted);font-size:12.5px;margin-top:2px"></div>
+    <div id="story" class="story" style="margin-top:8px"></div>
+    <div id="tags" style="margin-top:6px"></div>
+    <h2>Vehicles</h2>
+    <div id="vehs"></div>
+    <h2>Impact events</h2>
+    <div id="events"></div>
+    <h2>Reconstruction (Monte Carlo)</h2>
+    <div id="recon" style="font-size:12.5px;color:#c8d1db"></div>
+    <h2>Physics validation</h2>
+    <div id="valid" style="font-size:12px"></div>
+  </div>
+</main>
+<div class="controls">
+  <button id="play">▶ Play</button>
+  <input type="range" id="scrub" min="0" max="1000" value="0">
+  <span class="t" id="tlabel">0.00 s</span>
+  <select id="speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option>
+    <option value="1" selected>1×</option><option value="2">2×</option></select>
+</div>
+<footer>CrashLab v1 — planar 3-DOF rigid-body dynamics, per-wheel tire model, SAT collision + impulse-momentum
+  impact, sequential-Monte-Carlo rest-position reconstruction. Build date: <span id="builtOn"></span>.</footer>
+<script>
+const DATA = /*__DATA__*/null;
+
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+let S = { scene: null, t: 0, playing: false, speed: 1 };
+
+function loadScene(sc){
+  S.scene = sc; S.t = sc.t0 || 0; S.playing = false;
+  $("#play").textContent = "▶ Play";
+  $("#title").textContent = sc.title;
+  $("#subtitle").textContent = sc.subtitle;
+  $("#story").textContent = sc.story;
+  $("#tags").innerHTML = (sc.tags||[]).map(t => `<span class="tag">${esc(t)}</span>`).join("");
+  $("#vehs").innerHTML = sc.veh.map(v => `<div class="vrow"><span class="sw" style="background:${v.spec.color}"></span>
+    <div><b>${esc(v.label)}</b> · ${esc(v.spec.name)} · ${v.speed0.toFixed(0)} km/h${v.abs?" · ABS":""}
+    <div class="note">${esc(v.note)}</div></div></div>`).join("");
+  $("#events").innerHTML = sc.events.length ? sc.events.map(e => `<div class="ev">
+    <b>${esc(e.a)} × ${esc(e.b)}</b> at t=${e.t.toFixed(2)}s<br>
+    closing ${e.closing_kmh} km/h · ΔV ${e.a}: ${e.dv_a_kmh} km/h, ${e.b}: ${e.dv_b_kmh} km/h<br>
+    energy absorbed ${e.energy_kj} kJ · ${esc(e.zone_a)} of ${e.a} vs ${esc(e.zone_b)} of ${e.b}</div>`).join("")
+    : '<span style="color:var(--muted)">No impact in this scene.</span>';
+  const r = sc.recon;
+  $("#recon").innerHTML = r ? Object.entries(r.summary || {}).filter(([,v])=>v).map(([k,v]) =>
+      `<div class="kv"><span>${esc(k)}</span><b class="${v.inside90?'ok':'bad'}">${v.mean?.toFixed ? v.mean.toFixed(2) : ''} (truth ${v.inside90?'inside':'outside'} 90% CI)</b></div>`).join("")
+      + `<div style="color:var(--muted);margin-top:4px">${r.N||1200} particles · ${r.seconds||'?'}s</div>`
+    : '<span style="color:var(--muted)">Not reconstructed (single-vehicle or multi-impact scene).</span>';
+  const maxT = sc.frames.length * sc.dt;
+  $("#scrub").max = Math.round(maxT / sc.dt);
+  draw();
+}
+
+function fitView(sc, W, H){
+  const v = sc.view || [-20,-20,20,20];
+  const [x0,y0,x1,y1] = v;
+  const sx = W / (x1 - x0), sy = H / (y1 - y0);
+  const s = Math.min(sx, sy) * 0.92;
+  return { s, ox: W/2 - s*(x0+x1)/2, oy: H/2 + s*(y0+y1)/2 };
+}
+
+function draw(){
+  const sc = S.scene; if(!sc) return;
+  const cv = $("#cv"); const stage = $("#stage");
+  const W = stage.clientWidth, H = stage.clientHeight;
+  cv.width = W * devicePixelRatio; cv.height = H * devicePixelRatio;
+  cv.style.width = W+"px"; cv.style.height = H+"px";
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+  ctx.clearRect(0,0,W,H);
+  const { s, ox, oy } = fitView(sc, W, H);
+  const X = x => ox + s*x, Y = y => oy - s*y;
+
+  // road
+  ctx.fillStyle = "#1a2029";
+  for(const poly of sc.road.polys){ ctx.beginPath(); poly.forEach((p,i)=> i?ctx.lineTo(X(p[0]),Y(p[1])):ctx.moveTo(X(p[0]),Y(p[1]))); ctx.closePath(); ctx.fill(); }
+  for(const ln of sc.road.lines){
+    ctx.strokeStyle = ln.color; ctx.lineWidth = Math.max(1, ln.w*s); ctx.setLineDash(ln.dash ? ln.dash.map(d=>d*s/3) : []);
+    ctx.beginPath(); ln.pts.forEach((p,i)=> i?ctx.lineTo(X(p[0]),Y(p[1])):ctx.moveTo(X(p[0]),Y(p[1]))); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // tyre / scrape marks up to current time
+  for(const m of sc.marks){
+    const pts = m.pts.filter(p => p[2] <= S.t);
+    if(pts.length < 2) continue;
+    ctx.strokeStyle = "rgba(20,20,20,.75)"; ctx.lineWidth = Math.max(1, 0.12*s);
+    ctx.beginPath(); pts.forEach((p,i)=> i?ctx.lineTo(X(p[0]),Y(p[1])):ctx.moveTo(X(p[0]),Y(p[1]))); ctx.stroke();
+  }
+
+  // impact markers
+  for(const e of sc.events){
+    if(e.t > S.t) continue;
+    ctx.fillStyle = "#ff5d5d"; ctx.beginPath(); ctx.arc(X(e.P[0]), Y(e.P[1]), 4, 0, 7); ctx.fill();
+  }
+
+  // vehicles: interpolate from frames at S.t
+  const fi = Math.min(sc.frames.length - 1, Math.max(0, Math.round(S.t / sc.dt)));
+  const frame = sc.frames[fi];
+  sc.veh.forEach((v, k) => {
+    const [x,y,psi] = frame[k];
+    const L = v.spec.length, Wd = v.spec.width, off = v.spec.rect_off;
+    ctx.save();
+    ctx.translate(X(x), Y(y)); ctx.rotate(-psi);
+    ctx.fillStyle = v.spec.color; ctx.strokeStyle = "#000"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.rect(s*(off - L/2), -s*Wd/2, s*L, s*Wd); ctx.fill(); ctx.stroke();
+    ctx.fillStyle="#000"; ctx.beginPath(); ctx.moveTo(s*(off+L/2-0.1),-s*Wd*0.12); ctx.lineTo(s*(off+L/2+0.25),0);
+    ctx.lineTo(s*(off+L/2-0.1), s*Wd*0.12); ctx.fill();   // heading arrow
+    ctx.restore();
+    ctx.fillStyle = "#fff"; ctx.font = "12px ui-monospace,monospace"; ctx.textAlign="center";
+    ctx.fillText(v.label, X(x), Y(y) - 14);
+  });
+
+  $("#tlabel").textContent = S.t.toFixed(2) + " s";
+  $("#scrub").value = fi;
+}
+
+function tick(ts){
+  if(!S.playing){ return; }
+  if(!S._last) S._last = ts;
+  const dt = (ts - S._last) / 1000; S._last = ts;
+  S.t += dt * S.speed;
+  const maxT = S.scene.frames.length * S.scene.dt;
+  if(S.t >= maxT){ S.t = maxT; S.playing = false; $("#play").textContent = "▶ Play"; }
+  draw();
+  if(S.playing) requestAnimationFrame(tick);
+}
+
+$("#play").onclick = () => {
+  S.playing = !S.playing; $("#play").textContent = S.playing ? "⏸ Pause" : "▶ Play";
+  if(S.playing){ S._last = null; requestAnimationFrame(tick); }
+};
+$("#scrub").oninput = e => { S.t = (+e.target.value) * S.scene.dt; draw(); };
+$("#speed").onchange = e => { S.speed = +e.target.value; };
+window.addEventListener("resize", draw);
+
+$("#sceneSel").innerHTML = DATA.scenes.map((sc,i) => `<option value="${i}">${esc(sc.title)}</option>`).join("");
+$("#sceneSel").onchange = e => loadScene(DATA.scenes[+e.target.value]);
+$("#builtOn").textContent = DATA.meta?.built || "";
+$("#valid").innerHTML = (DATA.validation||[]).map(c => `<div class="kv"><span>${esc(c.name)}</span>
+  <b class="${c.ok?'ok':'bad'}">${c.ok?'✓':'✗'} ${esc(c.got)}</b></div>`).join("");
+
+loadScene(DATA.scenes[0]);
+</script>
+</body>
+</html>
